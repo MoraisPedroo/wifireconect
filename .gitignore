@@ -1,0 +1,5 @@
+# Arquivos gerados em cada máquina (não versionar)
+Logs/
+config.json
+*.har
+captura-portal-*.txt
