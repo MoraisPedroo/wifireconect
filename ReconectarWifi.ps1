@@ -301,25 +301,29 @@ function Invoke-Probe {
 
 function Testar-Conexao {
     # Devolve: @{ Estado = 'ONLINE'|'CATIVO'|'OFFLINE'; PortalUrl = '...' }
+    # Segue os redirects (nao usa -MaximumRedirection 0, que no PS 5.1 gera
+    # o erro "estado atual do objeto"). Se cair, o portal intercepta o
+    # connecttest.txt e a URL FINAL ja vira a pagina atual do portal.
     param($Cfg)
-    $p = Invoke-Probe -Url $Cfg.SondaUrl
-    if ($p.Status -eq 200 -and $p.Body -and ($p.Body -match [regex]::Escape($Cfg.SondaTextoOk))) {
-        return @{ Estado = 'ONLINE'; PortalUrl = $null }
-    }
-    # Procura a URL FRESCA do portal via sonda de redirect
-    $portal = $null
-    if ($p.Status -ge 300 -and $p.Status -lt 400 -and $p.Location) { $portal = $p.Location }
-    if (-not $portal) {
-        $p2 = Invoke-Probe -Url $Cfg.SondaRedirectUrl
-        if ($p2.Status -ge 300 -and $p2.Status -lt 400 -and $p2.Location) { $portal = $p2.Location }
-        elseif ($p2.Body -and $p2.Body -match 'https?://[^"'' ]*zooxwifi[^"'' ]*') { $portal = $Matches[0] }
-    }
-    if (-not $portal -and $p.Body -and $p.Body -match 'https?://[^"'' ]*zooxwifi[^"'' ]*') { $portal = $Matches[0] }
-
-    if ($portal -or ($p.Status -ge 300 -and $p.Status -lt 400) -or ($p.Status -eq 200)) {
+    try {
+        $r = Invoke-WebRequest -Uri $Cfg.SondaUrl -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+        if ($r.Content -and ($r.Content -match [regex]::Escape($Cfg.SondaTextoOk))) {
+            return @{ Estado = 'ONLINE'; PortalUrl = $null }
+        }
+        # Resposta diferente do esperado => portal cativo interceptou
+        $portal = $null
+        try { if ($r.BaseResponse.ResponseUri) { $portal = $r.BaseResponse.ResponseUri.AbsoluteUri } } catch {}
+        if ($r.Content -and ($r.Content -match 'https?://[^"'' ]*zooxwifi[^"'' ]*')) { $portal = $Matches[0] }
         return @{ Estado = 'CATIVO'; PortalUrl = $portal }
+    } catch {
+        # Falha de rede/TLS/DNS: pode ser o portal resetando, ou offline de fato.
+        $msg = $_.Exception.Message
+        $p2 = Invoke-Probe -Url $Cfg.SondaRedirectUrl
+        if ($p2.Status -ge 300 -and $p2.Status -lt 400 -and $p2.Location) { return @{ Estado = 'CATIVO'; PortalUrl = $p2.Location } }
+        if ($p2.Body -and ($p2.Body -match 'https?://[^"'' ]*zooxwifi[^"'' ]*')) { return @{ Estado = 'CATIVO'; PortalUrl = $Matches[0] } }
+        Write-Log ("Sonda falhou: {0}" -f $msg) 'DEBUG'
+        return @{ Estado = 'OFFLINE'; PortalUrl = $null }
     }
-    return @{ Estado = 'OFFLINE'; PortalUrl = $null }
 }
 
 function ConvertTo-UrlAbsoluta {
@@ -422,27 +426,19 @@ function Invoke-Login {
     }
 }
 
-function Capturar-Portal {
-    # Baixa TUDO da pagina do portal para um arquivo que voce me envia.
-    param($Cfg)
-    Write-Log 'Modo CAPTURA. Verificando estado da rede...' 'PASSO'
-    $est = Testar-Conexao -Cfg $Cfg
-    Write-Log ("Estado: {0}  PortalUrl: {1}" -f $est.Estado, $est.PortalUrl) 'INFO'
-    if ($est.Estado -eq 'ONLINE') {
-        Write-Log 'A internet esta ONLINE agora - nao ha portal para capturar.' 'AVISO'
-        Write-Log 'Rode este -Capturar QUANDO a conexao estiver caida (tela "Bem-vindo de volta").' 'AVISO'
-        return
-    }
-    $url = $est.PortalUrl
-    if (-not $url) { $url = Read-Host 'Nao detectei a URL. Cole a URL que aparece no navegador do portal' }
+function Salvar-CapturaPortal {
+    # Baixa TUDO da pagina do portal (form, scripts, botoes, HTML) para um arquivo.
+    # Retorna o caminho do arquivo, ou $null.
+    param([string] $Url)
+    if (-not $Url) { return $null }
     $arq = Join-Path $script:PastaLog ("captura-portal-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("CAPTURA DO PORTAL - $(Get-Date)")
-    [void]$sb.AppendLine("URL: $url")
+    [void]$sb.AppendLine("URL: $Url")
     [void]$sb.AppendLine(('=' * 70))
     try {
-        $pg = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 20 -MaximumRedirection 5
-        $baseUrl = $url; try { if ($pg.BaseResponse.ResponseUri) { $baseUrl = $pg.BaseResponse.ResponseUri.AbsoluteUri } } catch {}
+        $pg = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 20 -MaximumRedirection 5
+        $baseUrl = $Url; try { if ($pg.BaseResponse.ResponseUri) { $baseUrl = $pg.BaseResponse.ResponseUri.AbsoluteUri } } catch {}
         [void]$sb.AppendLine("URL FINAL: $baseUrl")
         [void]$sb.AppendLine("HTTP: $([int]$pg.StatusCode)")
         [void]$sb.AppendLine(''); [void]$sb.AppendLine('----- FORMULARIOS -----')
@@ -454,7 +450,7 @@ function Capturar-Portal {
         }
         [void]$sb.AppendLine(''); [void]$sb.AppendLine('----- SCRIPTS (src) -----')
         foreach ($m in [regex]::Matches($pg.Content, '(?i)<script[^>]*src\s*=\s*["'']([^"'']+)["'']')) { [void]$sb.AppendLine($m.Groups[1].Value) }
-        [void]$sb.AppendLine(''); [void]$sb.AppendLine('----- LINKS/BOTOES com "proximo/next" -----')
+        [void]$sb.AppendLine(''); [void]$sb.AppendLine('----- LINKS/BOTOES com proximo/next -----')
         foreach ($m in [regex]::Matches($pg.Content, '(?is)<(a|button)\b[^>]*>.*?</\1>')) {
             if ($m.Value -match '(?i)pr.?ximo|next') { [void]$sb.AppendLine(($m.Value -replace '\s+', ' ')) }
         }
@@ -462,13 +458,33 @@ function Capturar-Portal {
         [void]$sb.AppendLine($pg.Content)
     } catch {
         [void]$sb.AppendLine("ERRO ao baixar: $($_.Exception.Message)")
-        Write-LogErro $_ 'Falha na captura'
     }
     Set-Content -Path $arq -Value $sb.ToString() -Encoding UTF8
-    Write-Log ("Captura salva em: {0}" -f $arq) 'OK'
-    Write-Host ''
-    Write-Host '  >>> ME ENVIE o conteudo desse arquivo (abra, Ctrl+A, Ctrl+C) <<<' -ForegroundColor Green
-    Write-Host '  Com ele eu monto o login exato (LoginReplay) e fica 100% automatico.' -ForegroundColor Green
+    return $arq
+}
+
+function Capturar-Portal {
+    # Modo manual (-Capturar): captura agora, se estiver caido.
+    param($Cfg)
+    Write-Log 'Modo CAPTURA. Verificando estado da rede...' 'PASSO'
+    $est = Testar-Conexao -Cfg $Cfg
+    Write-Log ("Estado: {0}  PortalUrl: {1}" -f $est.Estado, $est.PortalUrl) 'INFO'
+    if ($est.Estado -eq 'ONLINE') {
+        Write-Log 'A internet esta ONLINE agora - nao ha portal para capturar.' 'AVISO'
+        Write-Log 'Rode -Capturar QUANDO a conexao estiver caida, OU deixe o monitor rodando (ele captura sozinho).' 'AVISO'
+        return
+    }
+    $url = $est.PortalUrl
+    if (-not $url) { $url = Read-Host 'Nao detectei a URL. Cole a URL que aparece no navegador do portal' }
+    $arq = Salvar-CapturaPortal -Url $url
+    if ($arq) {
+        Write-Log ("Captura salva em: {0}" -f $arq) 'OK'
+        Write-Host ''
+        Write-Host '  >>> ME ENVIE o conteudo desse arquivo (abra, Ctrl+A, Ctrl+C) <<<' -ForegroundColor Green
+        try { notepad $arq } catch {}
+    } else {
+        Write-Log 'Nao foi possivel capturar (sem URL do portal).' 'AVISO'
+    }
 }
 
 function Mostrar-Logs {
@@ -495,7 +511,7 @@ function Iniciar-Monitor {
     Write-Log 'Para parar: feche a janela ou pressione Ctrl+C.' 'INFO'
     Write-Log '====================================================================' 'PASSO'
 
-    $ciclos = 0; $quedas = 0; $recuperacoes = 0
+    $ciclos = 0; $quedas = 0; $recuperacoes = 0; $estadoAnterior = 'INICIO'
     while ($true) {
         $ciclos++
         try {
@@ -509,6 +525,12 @@ function Iniciar-Monitor {
             elseif ($est.Estado -eq 'CATIVO') {
                 $quedas++
                 Write-Log ("[ciclo {0}] PORTAL CATIVO detectado (queda #{1}). Recuperando..." -f $ciclos, $quedas) 'AVISO'
+
+                # Na PRIMEIRA deteccao da queda, salva uma captura do portal (para suporte).
+                if ($estadoAnterior -ne 'CATIVO' -and $est.PortalUrl) {
+                    $cap = Salvar-CapturaPortal -Url $est.PortalUrl
+                    if ($cap) { Write-Log ("Captura automatica do portal salva em: {0}" -f $cap) 'INFO' }
+                }
 
                 if (-not $SemReconectar -and $Cfg.ReconectarWifi) {
                     if ($atual -ne $Cfg.SSID) {
@@ -539,6 +561,7 @@ function Iniciar-Monitor {
                 Write-Log ("[ciclo {0}] OFFLINE (sem rede fisica/radio). Aguardando a placa voltar..." -f $ciclos) 'AVISO'
                 if (-not $SemReconectar -and $Cfg.ReconectarWifi) { Conectar-Wifi -SSID $Cfg.SSID | Out-Null }
             }
+            $estadoAnterior = $est.Estado
         } catch {
             Write-LogErro $_ "Erro inesperado no ciclo $ciclos"
         }

@@ -26,13 +26,15 @@ function Secao($titulo, $conteudo) {
 [void]$sb.AppendLine("Maquina: $env:COMPUTERNAME   Usuario: $env:USERNAME")
 [void]$sb.AppendLine("PowerShell: $($PSVersionTable.PSVersion)")
 
-Secao 'Get-NetAdapter' (try { Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,PhysicalMediaType,ifIndex,MacAddress | Format-Table -AutoSize } catch { $_.Exception.Message })
-Secao 'Get-NetConnectionProfile' (try { Get-NetConnectionProfile | Select-Object Name,InterfaceAlias,InterfaceIndex,NetworkCategory,IPv4Connectivity } catch { $_.Exception.Message })
-Secao 'Get-NetIPConfiguration' (try { Get-NetIPConfiguration | Format-List InterfaceAlias,IPv4Address,IPv4DefaultGateway,DNSServer } catch { $_.Exception.Message })
-Secao 'Get-NetRoute 0.0.0.0/0' (try { Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric } catch { $_.Exception.Message })
-Secao 'Servico WLAN AutoConfig (wlansvc)' (try { Get-Service wlansvc | Select-Object Name,Status,StartType } catch { $_.Exception.Message })
-Secao 'netsh wlan show interfaces' (try { netsh wlan show interfaces 2>&1 } catch { $_.Exception.Message })
-Secao 'netsh wlan show networks' (try { netsh wlan show networks 2>&1 } catch { $_.Exception.Message })
+function Coleta([ScriptBlock] $sb) { try { & $sb } catch { "ERRO: $($_.Exception.Message)" } }
+
+Secao 'Get-NetAdapter'            (Coleta { Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,PhysicalMediaType,ifIndex,MacAddress | Format-Table -AutoSize })
+Secao 'Get-NetConnectionProfile'  (Coleta { Get-NetConnectionProfile | Select-Object Name,InterfaceAlias,InterfaceIndex,NetworkCategory,IPv4Connectivity })
+Secao 'Get-NetIPConfiguration'    (Coleta { Get-NetIPConfiguration | Format-List InterfaceAlias,IPv4Address,IPv4DefaultGateway,DNSServer })
+Secao 'Get-NetRoute 0.0.0.0/0'    (Coleta { Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object ifIndex,InterfaceAlias,NextHop,RouteMetric })
+Secao 'Servico WLAN (wlansvc)'    (Coleta { Get-Service wlansvc | Select-Object Name,Status,StartType })
+Secao 'netsh wlan show interfaces'(Coleta { netsh wlan show interfaces 2>&1 })
+Secao 'netsh wlan show networks'  (Coleta { netsh wlan show networks 2>&1 })
 
 # --- Teste do portal cativo / internet ---
 $res = New-Object System.Text.StringBuilder
