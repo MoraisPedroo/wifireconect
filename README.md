@@ -10,7 +10,7 @@ Tudo em **PowerShell puro** — não instala nada.
 cd $HOME\Documents
 git clone https://github.com/MoraisPedroo/wifireconect.git
 cd wifireconect
-Set-ExecutionPolicy -Scope Process -Bypass
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\ReconectarWifi.ps1 -Configurar
 .\ReconectarWifi.ps1
 ```

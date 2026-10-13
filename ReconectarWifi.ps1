@@ -133,8 +133,25 @@ function Salvar-Config {
 }
 
 # ------------------------------------------------------------------ Wi-Fi
+function Get-WifiAdapter {
+    # Objeto do adaptador Wi-Fi via cmdlets nativos (funciona mesmo se netsh wlan estiver bloqueado).
+    try {
+        $cands = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+            $_.PhysicalMediaType -match '802\.11' -or
+            $_.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN|802\.11' -or
+            $_.Name -match 'Wi-?Fi|Wireless'
+        }
+        $up = $cands | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+        if ($up) { return $up }
+        if ($cands) { return ($cands | Select-Object -First 1) }
+    } catch {}
+    return $null
+}
+
 function Get-WifiInterface {
-    # Retorna o nome do adaptador Wi-Fi conectado/disponivel, ou $null.
+    # Nome do adaptador Wi-Fi (ou $null).
+    $a = Get-WifiAdapter
+    if ($a) { return $a.Name }
     try {
         $saida = netsh wlan show interfaces 2>$null
         $nome = ($saida | Select-String -Pattern '^\s*(Nome|Name)\s*:\s*(.+)$' | Select-Object -First 1)
@@ -144,7 +161,15 @@ function Get-WifiInterface {
 }
 
 function Get-WifiAtual {
-    # SSID atualmente conectado (ou $null).
+    # Nome da rede (SSID) conectada agora. Usa Get-NetConnectionProfile (camada de rede,
+    # independe do servico WLAN AutoConfig); cai para netsh so se precisar.
+    try {
+        $a = Get-WifiAdapter
+        if ($a) {
+            $prof = Get-NetConnectionProfile -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue
+            if ($prof) { return ($prof | Select-Object -First 1).Name }
+        }
+    } catch {}
     try {
         $saida = netsh wlan show interfaces 2>$null
         $linha = $saida | Select-String -Pattern '^\s*SSID\s*:\s*(.+)$' | Select-Object -First 1
@@ -187,44 +212,51 @@ function Selecionar-Wifi {
 
     $adapt = Get-WifiInterface
     if ($adapt) { Write-Log ("Adaptador Wi-Fi detectado: {0}" -f $adapt) 'INFO' }
-    else { Write-Log 'Nenhum adaptador Wi-Fi detectado pelo netsh. O menu ainda vai listar perfis salvos.' 'AVISO' }
+    else { Write-Log 'Nenhum adaptador Wi-Fi detectado. (Tudo bem: o monitor funciona so mantendo o portal vivo.)' 'AVISO' }
+
+    $atualConn = Get-WifiAtual
+    if ($atualConn) { Write-Log ("Rede conectada agora: '{0}'" -f $atualConn) 'INFO' }
 
     $visiveis = Get-RedesVisiveis
     $perfis   = Get-PerfisSalvos
     $todas = @()
-    foreach ($s in ($visiveis + $perfis)) { if ($s -and ($todas -notcontains $s)) { $todas += $s } }
+    foreach ($s in (@($atualConn) + $visiveis + $perfis)) { if ($s -and ($todas -notcontains $s)) { $todas += $s } }
 
     if ($todas.Count -eq 0) {
-        Write-Log 'Nao consegui listar nenhuma rede. Verifique se o Wi-Fi esta ligado.' 'AVISO'
-        $manual = Read-Host 'Digite o NOME exato do Wi-Fi (SSID)'
-        if ($manual.Trim()) { $Cfg.SSID = $manual.Trim(); Salvar-Config $Cfg }
+        Write-Log 'Nao consegui listar redes pelo Windows (netsh/WLAN pode estar bloqueado nesta maquina).' 'AVISO'
+        Write-Log 'Sem problema: o monitor so precisa do portal. Pode deixar em branco.' 'INFO'
+        $manual = Read-Host 'Digite o NOME do Wi-Fi (SSID) ou pressione ENTER para nao gerenciar Wi-Fi'
+        $Cfg.SSID = $manual.Trim()
+        $Cfg.ReconectarWifi = [bool]$Cfg.SSID
+        Salvar-Config $Cfg
         return $Cfg
     }
 
     Write-Host ''
-    Write-Host '  ===== REDES DISPONIVEIS =====' -ForegroundColor Cyan
+    Write-Host '  ===== REDES =====' -ForegroundColor Cyan
     for ($i = 0; $i -lt $todas.Count; $i++) {
         $marca = ''
+        if ($todas[$i] -eq $atualConn)      { $marca += ' [conectada agora]' }
         if ($visiveis -contains $todas[$i]) { $marca += ' [no alcance]' }
         if ($perfis   -contains $todas[$i]) { $marca += ' [salva]' }
         Write-Host ("   {0,2}) {1}{2}" -f ($i + 1), $todas[$i], $marca)
     }
+    Write-Host '    0) (nao gerenciar Wi-Fi - so manter o portal vivo)'
     Write-Host ''
-    $esc = Read-Host 'Escolha o numero do Wi-Fi (ou digite o nome exato)'
+    $esc = Read-Host 'Escolha o numero (ou o nome exato). ENTER usa a rede conectada agora'
     $escolhido = $null
-    if ($esc -match '^\d+$') {
+    if ([string]::IsNullOrWhiteSpace($esc)) { $escolhido = $atualConn }
+    elseif ($esc -eq '0') { $escolhido = '' }
+    elseif ($esc -match '^\d+$') {
         $idx = [int]$esc - 1
         if ($idx -ge 0 -and $idx -lt $todas.Count) { $escolhido = $todas[$idx] }
-    }
-    if (-not $escolhido -and $esc.Trim()) { $escolhido = $esc.Trim() }
+    } else { $escolhido = $esc.Trim() }
 
-    if ($escolhido) {
-        $Cfg.SSID = $escolhido
-        Salvar-Config $Cfg
-        Write-Log ("Wi-Fi escolhido e salvo: '{0}'" -f $escolhido) 'OK'
-    } else {
-        Write-Log 'Nenhuma escolha valida. Nada foi alterado.' 'AVISO'
-    }
+    $Cfg.SSID = [string]$escolhido
+    $Cfg.ReconectarWifi = [bool]$Cfg.SSID
+    Salvar-Config $Cfg
+    if ($Cfg.SSID) { Write-Log ("Wi-Fi escolhido e salvo: '{0}'" -f $Cfg.SSID) 'OK' }
+    else { Write-Log 'Salvo: nao gerenciar Wi-Fi (so manter o portal vivo).' 'OK' }
     return $Cfg
 }
 
@@ -452,13 +484,12 @@ function Iniciar-Monitor {
     param($Cfg)
 
     if (-not $Cfg.SSID) {
-        Write-Log 'Nenhum Wi-Fi configurado ainda. Abrindo o menu...' 'AVISO'
-        $Cfg = Selecionar-Wifi -Cfg $Cfg
-        if (-not $Cfg.SSID) { Write-Log 'Sem Wi-Fi definido. Encerrando.' 'ERRO'; return }
+        Write-Log 'Rodando em MODO PORTAL (sem gerenciar Wi-Fi). Para escolher um Wi-Fi depois: -Configurar' 'INFO'
     }
 
+    $alvo = if ($Cfg.SSID) { "'$($Cfg.SSID)'" } else { '(modo portal - sem gerenciar Wi-Fi)' }
     Write-Log '====================================================================' 'PASSO'
-    Write-Log ("MONITOR INICIADO  |  Wi-Fi alvo: '{0}'  |  Intervalo: {1}s" -f $Cfg.SSID, $Cfg.IntervaloSegundos) 'PASSO'
+    Write-Log ("MONITOR INICIADO  |  Wi-Fi alvo: {0}  |  Intervalo: {1}s" -f $alvo, $Cfg.IntervaloSegundos) 'PASSO'
     Write-Log ("Config: {0}" -f $script:ArqConfig) 'INFO'
     Write-Log ("Log   : {0}" -f $script:ArqLog) 'INFO'
     Write-Log 'Para parar: feche a janela ou pressione Ctrl+C.' 'INFO'

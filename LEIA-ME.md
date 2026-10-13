@@ -26,7 +26,7 @@ Tudo em **PowerShell puro** — não precisa instalar Node, Puppeteer nem nada.
 
 2. Libere a execução **só nesta janela**:
    ```powershell
-   Set-ExecutionPolicy -Scope Process -Bypass
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    ```
 
 3. Escolha seu Wi-Fi na lista (ele **salva** a escolha):
