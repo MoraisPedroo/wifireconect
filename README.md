@@ -23,6 +23,42 @@ rápida), `-Logs 120` (ver log), `-Capturar` (portal caído). Também há o
 > A chave do túnel fica em `mapanto-config.json` (lido do seu `.bat` na 1ª vez) e
 > **nunca vai pro GitHub** (está no `.gitignore`).
 
+O documento [Correção para outro agente](CORRECAO-MAPANTO-PARA-OUTRO-AGENTE.md)
+detalha as mudanças, a verificação e a aplicação no computador do túnel.
+
+### Como o Mapanto confirma que voltou a funcionar
+
+Rode `./Mapanto.ps1 -Status` para conferir o resultado. O supervisor usa a
+sonda da Microsoft e, se ela falhar, uma segunda sonda HTTPS. Resposta
+inesperada ou bloqueio de uma sonda aparece como `INDEFINIDO`; só tenta login
+quando encontra evidência de portal cativo.
+
+O túnel é verificado mesmo quando a sonda de internet falha:
+
+- `FUNCIONANDO`: o aplicativo local está acessível e respondeu pelo endereço público.
+- `CONECTADO`: o aplicativo local está acessível e o tunnelto tem conexão TCP de
+  saída; a consulta pública foi inconclusiva, por exemplo por TLS/proxy.
+- `APP_INDISPONIVEL`: a porta local configurada não responde. Reiniciar o
+  túnel não corrige isso.
+- `APP_ERRO`: o aplicativo respondeu com erro, inclusive quando o mesmo
+  502/503/504 aparece localmente e pela URL pública. Isso não reinicia o túnel.
+- `INDEFINIDO`: não foi possível confirmar a saúde. Esse estado não provoca reinício.
+
+Falhas confirmadas do túnel precisam atingir `FalhasParaReiniciar` ciclos
+consecutivos para provocar reinício. O encerramento do `.bat` lançador não
+conta como queda se o processo `tunnelto` continua ativo. O envio do formulário
+de login só é marcado como recuperação depois de uma nova sonda confirmar a conexão.
+
+`SondasAlternativas` pode ser configurado em `mapanto-config.json` com objetos
+`Url`, `Status` e `Texto` esperado. Configurações antigas recebem a segunda
+sonda automaticamente ao carregar.
+
+Para executar os testes de regressão sem depender da internet nem abrir o túnel:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Mapanto.Tests.ps1
+```
+
 ---
 
 ## Baixar no PC (via PowerShell)
