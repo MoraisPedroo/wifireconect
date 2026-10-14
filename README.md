@@ -4,6 +4,27 @@ Mantém a sessão do portal cativo **ZooxWiFi** autenticada automaticamente, par
 túnel (**tunn.dev**) e as impressoras **Zebra (ZPL)** não caírem a cada ~12 h.
 Tudo em **PowerShell puro** — não instala nada.
 
+## ⭐ Mapanto.ps1 — tudo em um (túnel + Wi-Fi) — RECOMENDADO
+
+`Mapanto.ps1` faz tudo num arquivo só: **inicia e vigia o túnel** (reabre quando
+ele cai **e também quando trava sem fechar**) e mantém o portal vivo, com logs.
+
+```powershell
+cd "$HOME\Documents\wifireconect-main"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\Mapanto.ps1 -Instalar    # abre sozinho no login (roda com a tela bloqueada)
+.\Mapanto.ps1              # ou rode agora
+```
+
+Comandos: `-Instalar` / `-Desinstalar` (início automático), `-Status` (checagem
+rápida), `-Logs 120` (ver log), `-Capturar` (portal caído). Também há o
+`INICIAR.bat` (duplo-clique) que substitui o `Clica aqui no tunel.bat`.
+
+> A chave do túnel fica em `mapanto-config.json` (lido do seu `.bat` na 1ª vez) e
+> **nunca vai pro GitHub** (está no `.gitignore`).
+
+---
+
 ## Baixar no PC (via PowerShell)
 
 ```powershell

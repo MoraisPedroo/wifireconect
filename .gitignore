@@ -1,5 +1,10 @@
 # Arquivos gerados em cada máquina (não versionar)
 Logs/
 config.json
+mapanto-config.json
 *.har
 captura-portal-*.txt
+
+# Contém a chave (--key) do túnel: NUNCA versionar
+Clica aqui no tunel.bat
+tunnel-*.log
