@@ -78,6 +78,7 @@ function Get-ConfigPadrao {
     [pscustomobject]@{
         TunnelExe            = 'C:\tunnelto\tunnelto.exe'
         TunnelDir            = 'C:\tunnelto'
+        TunnelBat            = ''
         Subdomain            = 'mapanto'
         PortaLocal           = 8080
         Key                  = ''
@@ -110,7 +111,7 @@ function Carregar-Config {
 function Salvar-Config { param($Cfg); $Cfg.UltimaAtualizacao = (Get-Date).ToString('s'); $Cfg | ConvertTo-Json -Depth 8 | Set-Content -Path $script:ArqConfig -Encoding UTF8 }
 
 function Resolver-Tunel {
-    # Descobre subdomain/port/key lendo o .bat existente, se a config ainda nao tem a chave.
+    # Localiza o tunnelto.exe e, principalmente, o .bat que JA FUNCIONA (usado como lancador).
     param($Cfg)
     if (-not (Test-Path $Cfg.TunnelExe)) {
         $alt = Get-ChildItem 'C:\' -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'tunnelto' } | Select-Object -First 1
@@ -118,18 +119,20 @@ function Resolver-Tunel {
         if ($alt) { $cand += (Join-Path $alt.FullName 'tunnelto.exe') }
         foreach ($c in $cand) { if (Test-Path $c) { $Cfg.TunnelExe = $c; $Cfg.TunnelDir = (Split-Path $c -Parent); break } }
     }
-    if ($Cfg.Key) { return $Cfg }
-    foreach ($loc in @($script:Raiz, $Cfg.TunnelDir, 'C:\tunnelto')) {
-        if ($loc -and (Test-Path $loc)) {
-            foreach ($b in (Get-ChildItem $loc -Filter *.bat -ErrorAction SilentlyContinue)) {
-                $txt = Get-Content $b.FullName -Raw -ErrorAction SilentlyContinue
-                if ($txt -and $txt -match 'tunnelto\.exe') {
-                    if ($txt -match '--subdomain\s+(\S+)') { $Cfg.Subdomain  = $Matches[1] }
-                    if ($txt -match '--port\s+(\d+)')      { $Cfg.PortaLocal = [int]$Matches[1] }
-                    if ($txt -match '--key\s+(\S+)')       { $Cfg.Key        = $Matches[1] }
-                    Write-Log ("Config do tunel lida de: {0}" -f $b.FullName) 'INFO'
-                    Salvar-Config $Cfg
-                    return $Cfg
+    if (-not $Cfg.TunnelBat -or -not (Test-Path $Cfg.TunnelBat)) {
+        foreach ($loc in @($Cfg.TunnelDir, 'C:\tunnelto', $script:Raiz)) {
+            if ($loc -and (Test-Path $loc)) {
+                foreach ($b in (Get-ChildItem $loc -Filter *.bat -ErrorAction SilentlyContinue)) {
+                    $txt = Get-Content $b.FullName -Raw -ErrorAction SilentlyContinue
+                    if ($txt -and $txt -match 'tunnelto\.exe') {
+                        $Cfg.TunnelBat = $b.FullName
+                        if ($txt -match '--subdomain\s+(\S+)') { $Cfg.Subdomain  = $Matches[1] }
+                        if ($txt -match '--port\s+(\d+)')      { $Cfg.PortaLocal = [int]$Matches[1] }
+                        if (-not $Cfg.Key -and $txt -match '--key\s+(\S+)') { $Cfg.Key = $Matches[1] }
+                        Write-Log ("Lancador do tunel encontrado: {0}" -f $b.FullName) 'INFO'
+                        Salvar-Config $Cfg
+                        return $Cfg
+                    }
                 }
             }
         }
@@ -270,26 +273,34 @@ function Test-TunelPublico {
 }
 function Iniciar-Tunel {
     param($Cfg)
-    if (-not (Test-Path $Cfg.TunnelExe)) { Write-Log ("tunnelto.exe NAO encontrado em: {0}" -f $Cfg.TunnelExe) 'ERRO'; return $null }
-    if (-not $Cfg.Key) { Write-Log 'Sem a chave (--key) do tunel. Coloque em mapanto-config.json ou mantenha o .bat na pasta.' 'ERRO'; return $null }
     try { Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
-    Start-Sleep -Milliseconds 600
-    $out = Join-Path $script:PastaLog 'tunnel-saida.log'
-    $err = Join-Path $script:PastaLog 'tunnel-erro.log'
+    Start-Sleep -Milliseconds 500
+    # PREFERE o .bat que ja funciona (console real, SEM redirect). Foi assim que o
+    # tunel conecta de verdade; esconder/redirecionar a saida faz o servidor recusar.
+    if ($Cfg.TunnelBat -and (Test-Path $Cfg.TunnelBat)) {
+        try {
+            $p = Start-Process -FilePath $Cfg.TunnelBat -WorkingDirectory (Split-Path $Cfg.TunnelBat -Parent) -WindowStyle Minimized -PassThru
+            $script:TunelProc = $p
+            $script:UltimoInicioTunel = Get-Date
+            Write-Log ("Tunel iniciado via '{0}' (janela minimizada, PID {1})." -f (Split-Path $Cfg.TunnelBat -Leaf),$p.Id) 'TUNEL'
+            return $p
+        } catch { Write-LogErro $_ 'Falha ao iniciar o tunel pelo .bat' }
+    }
+    # Fallback: exe direto, console minimizado, SEM redirect (igual ao .bat).
+    if (-not (Test-Path $Cfg.TunnelExe)) { Write-Log ("tunnelto.exe NAO encontrado em: {0}" -f $Cfg.TunnelExe) 'ERRO'; return $null }
+    if (-not $Cfg.Key) { Write-Log 'Sem a chave (--key) nem .bat. Coloque a chave em mapanto-config.json ou mantenha o .bat na pasta.' 'ERRO'; return $null }
     $argumentos = @('--subdomain',$Cfg.Subdomain,'--port',[string]$Cfg.PortaLocal,'--key',$Cfg.Key)
-    $mostra = ("--subdomain {0} --port {1} --key {2}" -f $Cfg.Subdomain,$Cfg.PortaLocal,(Mascarar $Cfg.Key))
     try {
-        # Redireciona a saida do tunnelto para arquivos (nos ajuda a ler o motivo
-        # exato quando ele recusa/cai, ex.: "Server denied the connection").
-        $p = Start-Process -FilePath $Cfg.TunnelExe -ArgumentList $argumentos -WorkingDirectory $Cfg.TunnelDir -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+        $p = Start-Process -FilePath $Cfg.TunnelExe -ArgumentList $argumentos -WorkingDirectory $Cfg.TunnelDir -WindowStyle Minimized -PassThru
         $script:TunelProc = $p
         $script:UltimoInicioTunel = Get-Date
-        Write-Log ("Tunel iniciado (PID {0}): tunnelto.exe {1}" -f $p.Id,$mostra) 'TUNEL'
+        Write-Log ("Tunel iniciado (PID {0}): tunnelto.exe --subdomain {1} --port {2} --key {3}" -f $p.Id,$Cfg.Subdomain,$Cfg.PortaLocal,(Mascarar $Cfg.Key)) 'TUNEL'
         return $p
     } catch { Write-LogErro $_ 'Falha ao iniciar o tunel'; return $null }
 }
 function Parar-Tunel {
-    try { if ($script:TunelProc -and -not $script:TunelProc.HasExited) { Stop-Process -Id $script:TunelProc.Id -Force -ErrorAction SilentlyContinue } } catch {}
+    # Mata a arvore inteira (cmd do .bat -> powershell -> tunnelto).
+    try { if ($script:TunelProc -and -not $script:TunelProc.HasExited) { & taskkill.exe /F /T /PID $script:TunelProc.Id 2>$null | Out-Null } } catch {}
     try { Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
 }
 function Reiniciar-Tunel {
@@ -310,9 +321,10 @@ function Mostrar-Cabecalho {
     Write-Host ('  +' + ('-'*$larg) + '+') -ForegroundColor Cyan
     Write-Host ('  |' + ('  MAPANTO - Supervisor de Tunel + Wi-Fi'.PadRight($larg)) + '|') -ForegroundColor Cyan
     Write-Host ('  +' + ('-'*$larg) + '+') -ForegroundColor Cyan
+    $lanc = if ($Cfg.TunnelBat) { ("  Lancador  : {0}" -f $Cfg.TunnelBat) } else { ("  Executavel: {0}  chave: {1}" -f $Cfg.TunnelExe,(Mascarar $Cfg.Key)) }
     $linhas = @(
         ("  Tunel     : {0} (porta {1})  ->  {2}" -f $Cfg.Subdomain,$Cfg.PortaLocal,$Cfg.UrlPublica),
-        ("  Executavel: {0}  chave: {1}" -f $Cfg.TunnelExe,(Mascarar $Cfg.Key)),
+        $lanc,
         ("  Intervalo : {0}s   Reinicia tunel apos {1} falhas seguidas" -f $Cfg.IntervaloSegundos,$Cfg.FalhasParaReiniciar),
         ("  Log       : {0}" -f $script:ArqLog)
     )
@@ -395,7 +407,9 @@ function Iniciar-Supervisor {
                     # Le o motivo que o proprio tunnelto deixou na saida de erro.
                     $motivo = ''
                     $errf = Join-Path $script:PastaLog 'tunnel-erro.log'
-                    if (Test-Path $errf) { try { $motivo = (((Get-Content $errf -Tail 6 -ErrorAction SilentlyContinue) -join ' | ') -replace $Cfg.Key,'****').Trim() } catch {} }
+                    if ((Test-Path $errf) -and $script:UltimoInicioTunel -and ((Get-Item $errf).LastWriteTime -gt $script:UltimoInicioTunel)) {
+                        try { $esc = if ($Cfg.Key) { [regex]::Escape($Cfg.Key) } else { '\x00nao\x00' }; $motivo = (((Get-Content $errf -Tail 6 -ErrorAction SilentlyContinue) -join ' | ') -replace $esc,'****').Trim() } catch {}
+                    }
                     $chaveRecusada = ($motivo -match '(?i)access key|denied|unauthor|forbidden|invalid')
                     if ($motivo) { Write-Log ("Saida do tunel: {0}" -f $motivo) 'INFO' }
                     if ($viveu -lt 20) { $mortesRapidas++ } else { $mortesRapidas = 0 }
