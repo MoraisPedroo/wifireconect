@@ -89,6 +89,7 @@ function Get-ConfigPadrao {
         SondaUrl             = 'http://www.msftconnecttest.com/connecttest.txt'
         SondaTextoOk         = 'Microsoft Connect Test'
         SondaRedirectUrl     = 'http://www.msftconnecttest.com/redirect'
+        SondasAlternativas   = @([pscustomobject]@{ Url='https://www.gstatic.com/generate_204'; Status=204; Texto='' })
         GerenciarTunel       = $true
         GerenciarPortal      = $true
         LoginReplay          = $null
@@ -113,6 +114,10 @@ function Salvar-Config { param($Cfg); $Cfg.UltimaAtualizacao = (Get-Date).ToStri
 function Resolver-Tunel {
     # Localiza o tunnelto.exe e, principalmente, o .bat que JA FUNCIONA (usado como lancador).
     param($Cfg)
+    # Configuracoes antigas podiam salvar outro subdominio mantendo a URL padrao.
+    if (-not $Cfg.UrlPublica -or ($Cfg.UrlPublica -eq 'https://mapanto.tunn.dev' -and $Cfg.Subdomain -ne 'mapanto')) {
+        $Cfg.UrlPublica = "https://$($Cfg.Subdomain).tunn.dev"
+    }
     if (-not (Test-Path $Cfg.TunnelExe)) {
         $alt = Get-ChildItem 'C:\' -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'tunnelto' } | Select-Object -First 1
         $cand = @('C:\tunnelto\tunnelto.exe')
@@ -126,7 +131,11 @@ function Resolver-Tunel {
                     $txt = Get-Content $b.FullName -Raw -ErrorAction SilentlyContinue
                     if ($txt -and $txt -match 'tunnelto\.exe') {
                         $Cfg.TunnelBat = $b.FullName
+                        $subAnterior = $Cfg.Subdomain
                         if ($txt -match '--subdomain\s+(\S+)') { $Cfg.Subdomain  = $Matches[1] }
+                        if (-not $Cfg.UrlPublica -or $Cfg.UrlPublica -eq "https://$subAnterior.tunn.dev") {
+                            $Cfg.UrlPublica = "https://$($Cfg.Subdomain).tunn.dev"
+                        }
                         if ($txt -match '--port\s+(\d+)')      { $Cfg.PortaLocal = [int]$Matches[1] }
                         if (-not $Cfg.Key -and $txt -match '--key\s+(\S+)') { $Cfg.Key = $Matches[1] }
                         Write-Log ("Lancador do tunel encontrado: {0}" -f $b.FullName) 'INFO'
@@ -142,36 +151,120 @@ function Resolver-Tunel {
 
 # ============================================================ PORTAL (HTTP)
 function Invoke-Probe {
-    param([string]$Url, [int]$TimeoutSec=8)
+    param([string]$Url, [int]$TimeoutSec=8, [switch]$SeguirRedirecionamentos)
+    $resultado = [pscustomobject]@{ Status=0; Location=$null; Body=$null; UrlFinal=$Url; Headers=$null; ContentHeaders=$null; Erro=$null }
     try {
-        $r = Invoke-WebRequest -Uri $Url -MaximumRedirection 0 -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
-        $loc=$null; try{$loc=$r.Headers.Location}catch{}
-        return [pscustomobject]@{ Status=[int]$r.StatusCode; Location=$loc; Body=$r.Content }
+        # Sondas nao seguem redirects; a checagem publica pode seguir ate tres.
+        $maxRedirect = if ($SeguirRedirecionamentos) { 3 } else { 0 }
+        $errosRequest = @()
+        $request = @{ Uri=$Url; MaximumRedirection=$maxRedirect; UseBasicParsing=$true; TimeoutSec=$TimeoutSec; Headers=@{'Cache-Control'='no-cache'; Pragma='no-cache'}; ErrorAction='SilentlyContinue'; ErrorVariable='errosRequest' }
+        # PS 7 pode descartar o corpo antes de lancar HttpResponseException.
+        # PS 5.1 emite um erro nao terminante COM a resposta ao usar maxredirect=0.
+        # Capturar esse erro preserva a resposta 302 em ambas as versoes.
+        if ((Get-Command Invoke-WebRequest -ErrorAction Stop).Parameters.ContainsKey('SkipHttpErrorCheck')) { $request.SkipHttpErrorCheck = $true }
+        $r = Invoke-WebRequest @request
+        if (-not $r) {
+            if ($errosRequest.Count) { throw $errosRequest[0] }
+            throw 'A sonda nao recebeu uma resposta HTTP.'
+        }
+        $resultado.Status = [int]$r.StatusCode
+        $resultado.Headers = $r.Headers
+        $resultado.Body = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
+        try { $resultado.Location = [string](@($r.Headers['Location'])[0]) } catch {}
+        try { if ($r.BaseResponse.ResponseUri) { $resultado.UrlFinal = $r.BaseResponse.ResponseUri.AbsoluteUri } } catch {}
+        try { if ($r.BaseResponse.RequestMessage.RequestUri) { $resultado.UrlFinal = $r.BaseResponse.RequestMessage.RequestUri.AbsoluteUri } } catch {}
     } catch {
         $resp=$null; try{$resp=$_.Exception.Response}catch{}
         if ($resp) {
-            $status=0; try{$status=[int]$resp.StatusCode}catch{}
-            $loc=$null; try{$loc=$resp.Headers['Location']}catch{}
-            $body=$null; try{$sr=New-Object IO.StreamReader($resp.GetResponseStream());$body=$sr.ReadToEnd();$sr.Close()}catch{}
-            return [pscustomobject]@{ Status=$status; Location=$loc; Body=$body }
+            try { $resultado.Status = [int]$resp.StatusCode } catch {}
+            $resultado.Headers = $resp.Headers
+            try { $resultado.Location = [string]$resp.Headers.Location } catch {}
+            if (-not $resultado.Location) { try { $resultado.Location = [string]$resp.Headers['Location'] } catch {} }
+            try { if ($resp.ResponseUri) { $resultado.UrlFinal = $resp.ResponseUri.AbsoluteUri } } catch {}
+            try { if ($resp.RequestMessage.RequestUri) { $resultado.UrlFinal = $resp.RequestMessage.RequestUri.AbsoluteUri } } catch {}
+            # Windows PowerShell 5.1 usa WebResponse; PowerShell 7 usa HttpResponseMessage.
+            if ($resp.PSObject.Methods.Name -contains 'GetResponseStream') {
+                $sr = $null
+                try { $sr = New-Object IO.StreamReader($resp.GetResponseStream()); $resultado.Body = $sr.ReadToEnd() } catch {}
+                finally { if ($sr) { $sr.Dispose() } }
+            } else {
+                try { $resultado.ContentHeaders = $resp.Content.Headers; $resultado.Body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch {}
+            }
+        } else {
+            $resultado.Erro = $_.Exception.Message
         }
-        return [pscustomobject]@{ Status=0; Location=$null; Body=$null }
     }
+    return $resultado
+}
+function Get-ProbePortal {
+    param($Probe, [string]$Url, [string]$PortalHost='zooxwifi.com')
+    $origem = $null; try { $origem = [Uri]$Url } catch {}
+    $destino = $null
+    if ($Probe.Location) { try { $destino = [Uri]::new([Uri]$Url, [string]$Probe.Location) } catch {} }
+    $final = $null; try { $final = [Uri]$Probe.UrlFinal } catch {}
+    foreach ($candidato in @($destino, $final)) {
+        if ($candidato -and ($candidato.Host -eq $PortalHost -or $candidato.Host.EndsWith('.'+$PortalHost, [StringComparison]::OrdinalIgnoreCase))) {
+            return [pscustomobject]@{ Url=$candidato.AbsoluteUri; Motivo='endereco do portal' }
+        }
+    }
+    $body = [string]$Probe.Body
+    foreach ($m in [regex]::Matches($body, 'https?://[^\s"''<>]*zooxwifi[^\s"''<>]*', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        $candidato = $null; try { $candidato = [Uri][Net.WebUtility]::HtmlDecode($m.Value) } catch {}
+        if ($candidato -and ($candidato.Host -eq $PortalHost -or $candidato.Host.EndsWith('.'+$PortalHost, [StringComparison]::OrdinalIgnoreCase))) {
+            return [pscustomobject]@{ Url=$candidato.AbsoluteUri; Motivo='portal informado na resposta' }
+        }
+    }
+    if ($Probe.Status -eq 511) {
+        return [pscustomobject]@{ Url=$(if($destino){$destino.AbsoluteUri}else{$null}); Motivo='HTTP 511 exige autenticacao' }
+    }
+    if ($Probe.Status -ge 300 -and $Probe.Status -lt 400 -and $destino -and $origem -and $destino.Host -ne $origem.Host) {
+        # /redirect normalmente leva ao Bing/MSN; isso nao e um portal cativo.
+        $microsoft = $false
+        foreach ($dominio in @('microsoft.com','msftconnecttest.com','msftncsi.com','bing.com','msn.com','live.com')) {
+            if ($destino.Host -eq $dominio -or $destino.Host.EndsWith('.'+$dominio, [StringComparison]::OrdinalIgnoreCase)) { $microsoft = $true; break }
+        }
+        if (-not $microsoft -and $destino.Scheme -in @('http','https')) {
+            return [pscustomobject]@{ Url=$destino.AbsoluteUri; Motivo='sonda redirecionada para autenticacao' }
+        }
+    }
+    $formLogin = $body -match '(?is)<form\b[^>]*>.*?<input\b[^>]*type\s*=\s*["'']?password\b'
+    $formPortal = ($body -match '(?is)<form\b[^>]*(?:login|signin|sign-in|auth)[^>]*>') -and ($body -match '(?i)captive\s+portal|portal\s+cativo|wi[\s-]?fi|acesso\s+[a\u00e0]\s+internet')
+    if ($formLogin -or $formPortal) {
+        $pagina = if ($final) { $final.AbsoluteUri } else { $Url }
+        return [pscustomobject]@{ Url=$pagina; Motivo='formulario de autenticacao interceptou a sonda' }
+    }
+    return $null
 }
 function Testar-Conexao {
     param($Cfg)
-    try {
-        $r = Invoke-WebRequest -Uri $Cfg.SondaUrl -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
-        if ($r.Content -and ($r.Content -match [regex]::Escape($Cfg.SondaTextoOk))) { return @{ Estado='ONLINE'; PortalUrl=$null } }
-        $portal=$null; try { if ($r.BaseResponse.ResponseUri) { $portal=$r.BaseResponse.ResponseUri.AbsoluteUri } } catch {}
-        if ($r.Content -and ($r.Content -match 'https?://[^"'' ]*zooxwifi[^"'' ]*')) { $portal=$Matches[0] }
-        return @{ Estado='CATIVO'; PortalUrl=$portal }
-    } catch {
-        $p2 = Invoke-Probe -Url $Cfg.SondaRedirectUrl
-        if ($p2.Status -ge 300 -and $p2.Status -lt 400 -and $p2.Location) { return @{ Estado='CATIVO'; PortalUrl=$p2.Location } }
-        if ($p2.Body -and ($p2.Body -match 'https?://[^"'' ]*zooxwifi[^"'' ]*')) { return @{ Estado='CATIVO'; PortalUrl=$Matches[0] } }
-        return @{ Estado='OFFLINE'; PortalUrl=$null }
+    $sondas = @([pscustomobject]@{ Url=$Cfg.SondaUrl; Status=200; Texto=$Cfg.SondaTextoOk })
+    if ($Cfg.SondasAlternativas) { $sondas += @($Cfg.SondasAlternativas) }
+    $detalhes = @(); $portal = $null; $houveResposta = $false
+    $portalHost = if ($Cfg.PortalHostContem) { [string]$Cfg.PortalHostContem } else { 'zooxwifi.com' }
+    foreach ($sonda in $sondas) {
+        if (-not $sonda.Url) { continue }
+        $r = Invoke-Probe -Url $sonda.Url
+        $houveResposta = $houveResposta -or ($r.Status -gt 0)
+        $mesmoHost = $false
+        try { $mesmoHost = ([Uri]$r.UrlFinal).Host -eq ([Uri]$sonda.Url).Host } catch {}
+        $textoEsperado = [string]$sonda.Texto
+        if ($r.Status -eq [int]$sonda.Status -and $mesmoHost -and ([string]$r.Body).Trim() -ceq $textoEsperado.Trim()) {
+            return @{ Estado='ONLINE'; PortalUrl=$null; Detalhe=("Sonda confirmada: {0} (HTTP {1})" -f $sonda.Url,$r.Status) }
+        }
+        $detalhes += if ($r.Status -gt 0) { "Sonda $($sonda.Url): HTTP $($r.Status), resposta inesperada" } else { "Sonda $($sonda.Url): $($r.Erro)" }
+        if (-not $portal) { $portal = Get-ProbePortal -Probe $r -Url $sonda.Url -PortalHost $portalHost }
     }
+    # Uma falha isolada da Microsoft nao autoriza login/reconexao. Primeiro tenta
+    # as alternativas; so considera CATIVO quando ha evidencia de autenticacao.
+    if (-not $portal -and $Cfg.SondaRedirectUrl) {
+        $r = Invoke-Probe -Url $Cfg.SondaRedirectUrl
+        $houveResposta = $houveResposta -or ($r.Status -gt 0)
+        $portal = Get-ProbePortal -Probe $r -Url $Cfg.SondaRedirectUrl -PortalHost $portalHost
+        $detalhes += "Sonda de redirect: HTTP $($r.Status)"
+    }
+    if ($portal) { return @{ Estado='CATIVO'; PortalUrl=$portal.Url; Detalhe=$portal.Motivo } }
+    $estado = if ($houveResposta) { 'INDEFINIDO' } else { 'OFFLINE' }
+    return @{ Estado=$estado; PortalUrl=$null; Detalhe=($detalhes -join '; ') }
 }
 function ConvertTo-UrlAbsoluta { param([string]$Base,[string]$Ref); try { return ([Uri]::new([Uri]$Base,$Ref)).AbsoluteUri } catch { return $Ref } }
 function Get-Formularios {
@@ -222,7 +315,7 @@ function Invoke-Login {
             $lr=$Cfg.LoginReplay; $hdr=@{}; if ($lr.Headers) { $lr.Headers.PSObject.Properties | ForEach-Object { $hdr[$_.Name]=$_.Value } }
             $a=@{ Uri=$lr.Url; Method=$lr.Method; UseBasicParsing=$true; TimeoutSec=15; Headers=$hdr }
             if ($lr.Body) { $a.Body=$lr.Body }; if ($lr.ContentType) { $a.ContentType=$lr.ContentType }
-            $r=Invoke-WebRequest @a; Write-Log ("Login (replay) HTTP {0}" -f [int]$r.StatusCode) 'OK'; return $true
+            $r=Invoke-WebRequest @a; Write-Log ("Login (replay) enviado: HTTP {0}. Confirmando conectividade..." -f [int]$r.StatusCode) 'INFO'; return $true
         } catch { Write-LogErro $_ 'Falha no login via replay' }
     }
     if (-not $PortalUrl) { Write-Log 'Sem URL do portal e sem replay. Rode -Capturar e me envie.' 'AVISO'; return $false }
@@ -235,11 +328,11 @@ function Invoke-Login {
             $body = ($f.Inputs.GetEnumerator() | ForEach-Object { "{0}={1}" -f [Uri]::EscapeDataString($_.Key),[Uri]::EscapeDataString([string]$_.Value) }) -join '&'
             if ($f.Method -eq 'POST') { $r=Invoke-WebRequest -Uri $f.ActionAbs -Method POST -Body $body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 5 }
             else { $sep='?'; if ($f.ActionAbs -match '\?') { $sep='&' }; $r=Invoke-WebRequest -Uri ($f.ActionAbs+$sep+$body) -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 5 }
-            Write-Log ("Formulario do portal enviado. HTTP {0}" -f [int]$r.StatusCode) 'OK'; return $true
+            Write-Log ("Formulario do portal enviado: HTTP {0}. Confirmando conectividade..." -f [int]$r.StatusCode) 'INFO'; return $true
         }
         if ($pg.Content -match '(?i)<meta[^>]*http-equiv=["'']?refresh["''][^>]*url=([^"''>\s]+)') {
             $dest=ConvertTo-UrlAbsoluta -Base $baseUrl -Ref $Matches[1]; $r=Invoke-WebRequest -Uri $dest -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 5
-            Write-Log ("Portal: segui meta-refresh. HTTP {0}" -f [int]$r.StatusCode) 'OK'; return $true
+            Write-Log ("Portal: segui meta-refresh: HTTP {0}. Confirmando conectividade..." -f [int]$r.StatusCode) 'INFO'; return $true
         }
         Write-Log 'Portal sem formulario simples (provavelmente JavaScript). Rode -Capturar e me envie.' 'AVISO'; return $false
     } catch { Write-LogErro $_ "Falha ao processar portal ($PortalUrl)"; return $false }
@@ -248,42 +341,102 @@ function Invoke-Login {
 # ============================================================ TUNEL
 function Test-PortaLocal {
     param([int]$Porta)
+    $c = $null
     try {
         $c = New-Object Net.Sockets.TcpClient
         $iar = $c.BeginConnect('127.0.0.1',$Porta,$null,$null)
         $ok = $iar.AsyncWaitHandle.WaitOne(2000)
-        if ($ok -and $c.Connected) { $c.EndConnect($iar); $c.Close(); return $true }
-        $c.Close(); return $false
-    } catch { return $false }
+        if ($ok -and $c.Connected) { $c.EndConnect($iar); return $true }
+        return $false
+    } catch { return $false } finally { if ($c) { $c.Close() } }
+}
+function Test-TunelEmExecucao {
+    # O .bat pode terminar depois de abrir o tunnelto em outro processo.
+    # A vida do lancador nao determina a vida do tunel.
+    if (Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue) { return $true }
+    return [bool]($script:TunelProc -and -not $script:TunelProc.HasExited)
 }
 function Test-TunelConectado {
-    # Verificacao LOCAL e confiavel: o processo tunnelto tem conexao TCP de saida
-    # estabelecida (= tunel ligado ao servidor)? Nao depende de acessar a URL de fora
-    # (que falha por TLS/proxy no proprio PC). Retorna $true / $false / $null (indefinido).
+    # TCP confirma a conexao ao servidor, mas nao garante que o app responde.
+    # Erro de consulta deve ser indefinido, nunca uma queda confirmada.
     try {
         $procs = Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue
-        if (-not $procs) { return $null }   # sem processo agora (a .bat pode estar entre tentativas)
+        if (-not $procs) { return $null }
         $ids = @($procs | ForEach-Object { $_.Id })
-        $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-                 Where-Object { ($ids -contains $_.OwningProcess) -and ($_.RemoteAddress -notin @('127.0.0.1','::1','0.0.0.0')) }
-        if ($conns) { return $true } else { return $false }
-    } catch { return $null }   # Get-NetTCPConnection indisponivel -> indefinido
+        # Enumerar antes de filtrar evita o erro CIM "nenhum objeto encontrado"
+        # de -State/-OwningProcess quando nao ha conexoes correspondentes.
+        $conns = Get-NetTCPConnection -ErrorAction Stop |
+                 Where-Object { $_.State -eq 'Established' -and ($ids -contains $_.OwningProcess) -and
+                     $_.RemoteAddress -notmatch '^(127\.|::ffff:127\.)' -and
+                     $_.RemoteAddress -notin @('::1','0.0.0.0','::') }
+        return [bool]$conns
+    } catch { return $null }
 }
 function Test-TunelPublico {
     param([string]$Url,[int]$TimeoutSec=10)
-    try {
-        $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 3 -ErrorAction Stop
-        return @{ Ok=$true; Definitivo=$true; Detalhe=("HTTP {0}" -f [int]$r.StatusCode) }
-    } catch {
-        $resp=$null; try{$resp=$_.Exception.Response}catch{}
-        if ($resp) {
-            $sc=0; try{$sc=[int]$resp.StatusCode}catch{}
-            if ($sc -in @(502,503,504,522,523,524)) { return @{ Ok=$false; Definitivo=$true; Detalhe=("HTTP {0} tunel sem resposta" -f $sc) } }
-            return @{ Ok=$true; Definitivo=$true; Detalhe=("HTTP {0} (app respondeu)" -f $sc) }
-        }
-        # Sem resposta HTTP (TLS/proxy/timeout do proprio PC) = inconclusivo, NAO reinicia.
-        return @{ Ok=$false; Definitivo=$false; Detalhe=("checagem externa indisponivel: {0}" -f $_.Exception.Message) }
+    $r = Invoke-Probe -Url $Url -TimeoutSec $TimeoutSec -SeguirRedirecionamentos
+    $portal = Get-ProbePortal -Probe $r -Url $Url
+    # O app pode ter seu proprio login. Fora das sondas, um campo password
+    # sozinho nao prova portal cativo; exija contexto de rede ou portal conhecido.
+    if ($portal -and ($portal.Motivo -in @('endereco do portal','portal informado na resposta','HTTP 511 exige autenticacao') -or
+        $r.Body -match '(?i)captive\s+portal|portal\s+cativo')) {
+        return @{ Ok=$false; Definitivo=$false; Detalhe='resposta publica exige autenticacao; verificacao inconclusiva' }
     }
+    if ($r.UrlFinal -and ([Uri]$r.UrlFinal).Host -ne ([Uri]$Url).Host) {
+        return @{ Ok=$false; Definitivo=$false; Detalhe='URL publica redirecionou para outro host; verificacao inconclusiva' }
+    }
+    # O servidor tunnelto tambem devolve 404 quando nao existe cliente ligado.
+    # Diferencie essa resposta do 404 normal de uma rota inexistente do app.
+    if (($r.Status -eq 404 -and ([string]$r.Body).Trim() -eq 'Error: Tunnel Not Found') -or
+        ($r.Status -eq 500 -and ([string]$r.Body).Trim() -eq 'Error: Error finding tunnel')) {
+        return @{ Ok=$false; Definitivo=$true; Detalhe=("HTTP {0} servidor nao encontrou o tunel" -f $r.Status) }
+    }
+    if ($r.Status -in @(502,503,504,522,523,524)) {
+        return @{ Ok=$false; Definitivo=$true; Status=$r.Status; Detalhe=("HTTP {0} tunel sem resposta" -f $r.Status) }
+    }
+    # 404/405 sao respostas validas de apps que nao possuem GET na raiz.
+    if ($r.Status -ge 200 -and $r.Status -lt 600 -and $r.Status -notin @(301,302,303,307,308,407)) {
+        return @{ Ok=$true; Definitivo=$true; ErroApp=($r.Status -ge 500); Detalhe=("HTTP {0} (app respondeu)" -f $r.Status) }
+    }
+    return @{ Ok=$false; Definitivo=$false; Detalhe=("checagem publica inconclusiva: HTTP {0}; {1}" -f $r.Status,$r.Erro) }
+}
+function Test-SaudeTunel {
+    param($Cfg)
+    $local = Test-PortaLocal -Porta $Cfg.PortaLocal
+    $conectado = Test-TunelConectado
+    $pub = @{ Ok=$false; Definitivo=$false; Detalhe='app local indisponivel' }
+    $estado = 'APP_INDISPONIVEL'; $reiniciar = $false
+    $detalhe = "app local na porta $($Cfg.PortaLocal) nao responde"
+    if ($local) {
+        $pub = Test-TunelPublico -Url $Cfg.UrlPublica
+        if ($pub.Ok) {
+            $estado = if ($pub.ErroApp) { 'APP_ERRO' } else { 'FUNCIONANDO' }
+            $detalhe = $pub.Detalhe
+        } elseif ($pub.Definitivo) {
+            $estado = 'FALHA_PUBLICA'; $detalhe = $pub.Detalhe; $reiniciar = $true
+            if ($pub.Status -in @(502,503,504)) {
+                # Esses codigos tambem podem vir do app. Compare a mesma rota
+                # local antes de atribuir o erro ao tunel.
+                $caminho = ([Uri]$Cfg.UrlPublica).PathAndQuery
+                $urlLocal = "http://127.0.0.1:{0}{1}" -f $Cfg.PortaLocal,$caminho
+                $app = Invoke-Probe -Url $urlLocal
+                $respostaLocal = $false
+                try { $finalLocal = [Uri]$app.UrlFinal; $respostaLocal = $finalLocal.Host -eq '127.0.0.1' -and $finalLocal.Port -eq $Cfg.PortaLocal } catch {}
+                if ($respostaLocal -and $app.Status -eq $pub.Status) {
+                    $estado = 'APP_ERRO'; $detalhe = "app local e publico responderam HTTP $($pub.Status)"; $reiniciar = $false
+                } elseif ($app.Status -eq 0) {
+                    $estado = 'APP_INDISPONIVEL'; $detalhe = 'porta local aberta, mas o app nao respondeu ao HTTP'; $reiniciar = $false
+                }
+            }
+        } elseif ($conectado -eq $true) {
+            $estado = 'CONECTADO'; $detalhe = "saida TCP estabelecida; $($pub.Detalhe)"
+        } elseif ($conectado -eq $false) {
+            $estado = 'SEM_CONEXAO'; $detalhe = 'tunnelto sem conexao TCP de saida'; $reiniciar = $true
+        } else {
+            $estado = 'INDEFINIDO'; $detalhe = "consulta TCP indisponivel; $($pub.Detalhe)"
+        }
+    }
+    return @{ Estado=$estado; Detalhe=$detalhe; Reiniciar=$reiniciar; Local=$local; Conectado=$conectado; Publico=$pub }
 }
 function Iniciar-Tunel {
     param($Cfg)
@@ -372,15 +525,15 @@ function Mostrar-Logs { param([int]$N); if (-not (Test-Path $script:ArqLog)) { W
 function Status-Unico {
     param($Cfg)
     $est = Testar-Conexao -Cfg $Cfg
-    $local = Test-PortaLocal -Porta $Cfg.PortaLocal
     $proc = Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue
-    $conn = Test-TunelConectado
-    $pub = Test-TunelPublico -Url $Cfg.UrlPublica
-    Write-Log ("Internet   : {0}" -f $est.Estado) 'INFO'
+    $saude = Test-SaudeTunel -Cfg $Cfg
+    $conn = $saude.Conectado; $pub = $saude.Publico
+    Write-Log ("Internet   : {0} ({1})" -f $est.Estado,$est.Detalhe) 'INFO'
     Write-Log ("Processo   : {0}" -f ($(if($proc){"tunnelto rodando (PID $(($proc | ForEach-Object { $_.Id }) -join ','))"}else{'NAO esta rodando'}))) 'INFO'
     Write-Log ("Tunel conex: {0}" -f ($(if($conn -eq $true){'CONECTADO (saida estabelecida)'}elseif($conn -eq $false){'SEM conexao de saida'}else{'indefinido'}))) 'INFO'
-    Write-Log ("App local  : porta {0} -> {1}" -f $Cfg.PortaLocal,($(if($local){'OK'}else{'nao responde'}))) 'INFO'
-    Write-Log ("Tunel publ.: {0} -> {1} ({2})" -f $Cfg.UrlPublica,($(if($pub.Ok){'OK'}else{'nao deu (normal do proprio PC)'})),$pub.Detalhe) 'INFO'
+    Write-Log ("App local  : porta {0} -> {1}" -f $Cfg.PortaLocal,($(if($saude.Local){'OK'}else{'nao responde'}))) 'INFO'
+    Write-Log ("Tunel publ.: {0} -> {1} ({2})" -f $Cfg.UrlPublica,($(if($pub.Ok){'OK'}elseif($pub.Definitivo){'FALHA CONFIRMADA'}else{'INCONCLUSIVO'})),$pub.Detalhe) 'INFO'
+    Write-Log ("Resultado  : {0} ({1})" -f $saude.Estado,$saude.Detalhe) $(if($saude.Estado -in @('FUNCIONANDO','CONECTADO')){'OK'}else{'AVISO'})
 }
 
 # ============================================================ LOOP PRINCIPAL
@@ -403,13 +556,14 @@ function Iniciar-Supervisor {
             if ($Cfg.GerenciarPortal -and -not $SemPortal) {
                 $est = Testar-Conexao -Cfg $Cfg
                 if ($est.Estado -eq 'CATIVO') {
-                    $quedasPortal++
+                    if ($estadoAnterior -ne 'CATIVO') { $quedasPortal++ }
                     Write-Log ("[ciclo {0}] PORTAL CATIVO (queda #{1}). Recuperando..." -f $ciclo,$quedasPortal) 'AVISO'
                     if ($estadoAnterior -ne 'CATIVO' -and $est.PortalUrl) { $cap=Salvar-CapturaPortal -Url $est.PortalUrl; if ($cap) { Write-Log ("Captura automatica: {0}" -f $cap) 'INFO' } }
                     Invoke-Login -Cfg $Cfg -PortalUrl $est.PortalUrl | Out-Null
                     Start-Sleep -Seconds 3
                     $est = Testar-Conexao -Cfg $Cfg
                     if ($est.Estado -eq 'ONLINE') { Write-Log 'Portal recuperado: internet voltou.' 'OK' }
+                    else { Write-Log ("Login ainda sem confirmacao: {0} ({1})." -f $est.Estado,$est.Detalhe) 'AVISO' }
                 }
                 $estadoAnterior = $est.Estado
             }
@@ -417,7 +571,7 @@ function Iniciar-Supervisor {
             # ---- 2) TUNEL ----
             $tunelInfo = 'desligado'
             if ($Cfg.GerenciarTunel -and -not $SemTunel) {
-                $vivo = ($script:TunelProc -and -not $script:TunelProc.HasExited)
+                $vivo = Test-TunelEmExecucao
                 if (-not $vivo) {
                     $viveu = if ($script:UltimoInicioTunel) { ((Get-Date) - $script:UltimoInicioTunel).TotalSeconds } else { 999 }
                     # Le o motivo que o proprio tunnelto deixou na saida de erro.
@@ -459,57 +613,37 @@ function Iniciar-Supervisor {
                     $falhasTunel=0; $tunelInfo='reaberto (tinha caido)'
                 }
                 elseif ((Get-Date) -lt $script:ProximaChecagemTunel) {
-                    $tunelInfo = ("OK (PID {0}, aquecendo)" -f $script:TunelProc.Id)
-                }
-                elseif ($Cfg.GerenciarPortal -and $est.Estado -ne 'ONLINE' -and -not $SemPortal) {
-                    $tunelInfo = ("aguardando internet ({0})" -f $est.Estado)
+                    $tunelInfo = 'INICIANDO (aguardando a primeira verificacao)'
                 }
                 else {
-                    $conectado = Test-TunelConectado
-                    if ($conectado -eq $true) {
-                        $falhasTunel = 0; $tunelInfo = 'OK (tunel conectado)'
+                    # Verifique o tunel mesmo se a sonda de internet falhou.
+                    # Uma impressao pode funcionar com a sonda Microsoft bloqueada.
+                    $saude = Test-SaudeTunel -Cfg $Cfg
+                    $tunelInfo = "{0} ({1})" -f $saude.Estado,$saude.Detalhe
+                    if ($saude.Reiniciar -and $est.Estado -in @('CATIVO','OFFLINE')) {
+                        $falhasTunel = 0
+                        $tunelInfo = "aguardando internet ({0}); {1}" -f $est.Estado,$saude.Detalhe
                     }
-                    elseif ($conectado -eq $false) {
-                        # Processo vivo, mas SEM conexao de saida = provavel travamento real.
+                    elseif ($saude.Reiniciar) {
                         $falhasTunel++
-                        Write-Log ("[ciclo {0}] tunnelto vivo mas SEM conexao de saida [{1}/{2}] (possivel travamento)." -f $ciclo,$falhasTunel,$Cfg.FalhasParaReiniciar) 'AVISO'
+                        Write-Log ("[ciclo {0}] Falha do tunel: {1} [{2}/{3}]." -f $ciclo,$saude.Detalhe,$falhasTunel,$Cfg.FalhasParaReiniciar) 'AVISO'
                         if ($falhasTunel -ge $Cfg.FalhasParaReiniciar) {
                             $reinicios++
-                            Reiniciar-Tunel -Cfg $Cfg -Motivo ("tunel sem conexao de saida (reinicio #{0})" -f $reinicios)
+                            Reiniciar-Tunel -Cfg $Cfg -Motivo ("{0} (reinicio #{1})" -f $saude.Detalhe,$reinicios)
                             $script:ProximaChecagemTunel = (Get-Date).AddSeconds($Cfg.GraceAposReinicioSeg)
                             $falhasTunel = 0; $tunelInfo = 'REABERTO (estava travado)'
-                        } else { $tunelInfo = 'instavel (sem conexao de saida)' }
+                        }
                     }
                     else {
-                        # $null: nao deu pra checar pelo processo. Usa a checagem externa,
-                        # mas so reinicia se for um erro DEFINITIVO (502/503/504), nunca por TLS/proxy.
-                        $pub = Test-TunelPublico -Url $Cfg.UrlPublica
-                        if ($pub.Ok) { $falhasTunel = 0; $tunelInfo = ("OK ({0})" -f $pub.Detalhe) }
-                        elseif ($pub.Definitivo) {
-                            $local = Test-PortaLocal -Porta $Cfg.PortaLocal
-                            if (-not $local) {
-                                $falhasTunel = 0; $tunelInfo = 'app local 8080 nao responde'
-                                Write-Log ("[ciclo {0}] App local na porta {1} nao responde (nao e o tunel)." -f $ciclo,$Cfg.PortaLocal) 'AVISO'
-                            } else {
-                                $falhasTunel++
-                                Write-Log ("[ciclo {0}] Tunel sem resposta ({1}) [{2}/{3}]." -f $ciclo,$pub.Detalhe,$falhasTunel,$Cfg.FalhasParaReiniciar) 'AVISO'
-                                if ($falhasTunel -ge $Cfg.FalhasParaReiniciar) {
-                                    $reinicios++
-                                    Reiniciar-Tunel -Cfg $Cfg -Motivo ("tunel travado - {0} (reinicio #{1})" -f $pub.Detalhe,$reinicios)
-                                    $script:ProximaChecagemTunel = (Get-Date).AddSeconds($Cfg.GraceAposReinicioSeg)
-                                    $falhasTunel = 0; $tunelInfo = 'REABERTO (estava travado)'
-                                } else { $tunelInfo = ("instavel ({0})" -f $pub.Detalhe) }
-                            }
-                        }
-                        else { $falhasTunel = 0; $tunelInfo = 'OK (checagem externa indisponivel deste PC)' }
+                        $falhasTunel = 0
                     }
                 }
             }
 
             # ---- 3) STATUS ----
             $nivel='OK'
-            if ($tunelInfo -match 'reaberto|REABERTO|travad|instavel|NAO responde|aguardando' -or $est.Estado -eq 'OFFLINE') { $nivel='AVISO' }
-            Write-Log ("[ciclo {0}] internet: {1} | tunel: {2}" -f $ciclo,$est.Estado,$tunelInfo) $nivel
+            if ($tunelInfo -match 'reaberto|travad|SEM_CONEXAO|FALHA_PUBLICA|APP_INDISPONIVEL|APP_ERRO|INDEFINIDO|INICIANDO|aguardando' -or $est.Estado -in @('CATIVO','OFFLINE','INDEFINIDO')) { $nivel='AVISO' }
+            Write-Log ("[ciclo {0}] internet: {1} ({2}) | tunel: {3}" -f $ciclo,$est.Estado,$est.Detalhe,$tunelInfo) $nivel
         } catch { Write-LogErro $_ "Erro inesperado no ciclo $ciclo" }
         Start-Sleep -Seconds $Cfg.IntervaloSegundos
     }
