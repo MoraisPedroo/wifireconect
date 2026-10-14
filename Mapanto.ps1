@@ -50,6 +50,7 @@ if (-not (Test-Path $script:PastaLog)) { New-Item -ItemType Directory -Path $scr
 $script:ArqLog    = Join-Path $script:PastaLog ("mapanto-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
 $script:TunelProc = $null
 $script:ProximaChecagemTunel = Get-Date
+$script:UltimoInicioTunel = $null
 
 # ============================================================ LOG
 function Write-Log {
@@ -273,13 +274,15 @@ function Iniciar-Tunel {
     if (-not $Cfg.Key) { Write-Log 'Sem a chave (--key) do tunel. Coloque em mapanto-config.json ou mantenha o .bat na pasta.' 'ERRO'; return $null }
     try { Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
     Start-Sleep -Milliseconds 600
-    $out = Join-Path $script:PastaLog 'tunnel-saida.log'
-    $err = Join-Path $script:PastaLog 'tunnel-erro.log'
     $argumentos = @('--subdomain',$Cfg.Subdomain,'--port',[string]$Cfg.PortaLocal,'--key',$Cfg.Key)
     $mostra = ("--subdomain {0} --port {1} --key {2}" -f $Cfg.Subdomain,$Cfg.PortaLocal,(Mascarar $Cfg.Key))
     try {
-        $p = Start-Process -FilePath $Cfg.TunnelExe -ArgumentList $argumentos -WorkingDirectory $Cfg.TunnelDir -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+        # SEM redirecionar a saida: o tunnelto desenha um painel no console e
+        # alguns builds SAEM na hora se a saida vai para arquivo. Rodamos numa
+        # janela propria minimizada (console real), igual ao .bat que funciona.
+        $p = Start-Process -FilePath $Cfg.TunnelExe -ArgumentList $argumentos -WorkingDirectory $Cfg.TunnelDir -WindowStyle Minimized -PassThru
         $script:TunelProc = $p
+        $script:UltimoInicioTunel = Get-Date
         Write-Log ("Tunel iniciado (PID {0}): tunnelto.exe {1}" -f $p.Id,$mostra) 'TUNEL'
         return $p
     } catch { Write-LogErro $_ 'Falha ao iniciar o tunel'; return $null }
@@ -362,7 +365,7 @@ function Iniciar-Supervisor {
         $script:ProximaChecagemTunel = (Get-Date).AddSeconds($Cfg.GraceAposReinicioSeg)
     }
 
-    $ciclo=0; $falhasTunel=0; $reinicios=0; $quedasPortal=0; $estadoAnterior='INICIO'
+    $ciclo=0; $falhasTunel=0; $reinicios=0; $quedasPortal=0; $estadoAnterior='INICIO'; $mortesRapidas=0
     while ($true) {
         $ciclo++
         try {
@@ -387,7 +390,22 @@ function Iniciar-Supervisor {
             if ($Cfg.GerenciarTunel -and -not $SemTunel) {
                 $vivo = ($script:TunelProc -and -not $script:TunelProc.HasExited)
                 if (-not $vivo) {
-                    Write-Log ("[ciclo {0}] Processo do tunel caiu. Reabrindo..." -f $ciclo) 'TUNEL'
+                    $viveu = if ($script:UltimoInicioTunel) { ((Get-Date) - $script:UltimoInicioTunel).TotalSeconds } else { 999 }
+                    if ($viveu -lt 20) { $mortesRapidas++ } else { $mortesRapidas = 0 }
+                    if ($mortesRapidas -ge 3) {
+                        Write-Log '---------------------------------------------------------------' 'ERRO'
+                        Write-Log 'O TUNEL ESTA ABRINDO E FECHANDO EM SEGUNDOS, repetidamente.' 'ERRO'
+                        Write-Log 'Causas provaveis:' 'ERRO'
+                        Write-Log '  1) O subdominio "mapanto" ja esta em uso em OUTRA janela/PC' 'ERRO'
+                        Write-Log '     -> feche o "Clica aqui no tunel.bat" antigo em QUALQUER maquina.' 'ERRO'
+                        Write-Log '  2) A chave (--key) esta invalida/expirada.' 'ERRO'
+                        Write-Log '  3) O tunnelto.exe nao consegue sair para a internet.' 'ERRO'
+                        Write-Log 'Esperando 60s antes de tentar de novo (evita loop).' 'ERRO'
+                        Write-Log '---------------------------------------------------------------' 'ERRO'
+                        Start-Sleep -Seconds 60
+                        $mortesRapidas = 0
+                    }
+                    Write-Log ("[ciclo {0}] Processo do tunel caiu (viveu {1:n0}s). Reabrindo..." -f $ciclo,$viveu) 'TUNEL'
                     Iniciar-Tunel -Cfg $Cfg | Out-Null
                     $script:ProximaChecagemTunel = (Get-Date).AddSeconds($Cfg.GraceAposReinicioSeg)
                     $falhasTunel=0; $tunelInfo='reaberto (tinha caido)'
