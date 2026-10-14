@@ -256,19 +256,33 @@ function Test-PortaLocal {
         $c.Close(); return $false
     } catch { return $false }
 }
+function Test-TunelConectado {
+    # Verificacao LOCAL e confiavel: o processo tunnelto tem conexao TCP de saida
+    # estabelecida (= tunel ligado ao servidor)? Nao depende de acessar a URL de fora
+    # (que falha por TLS/proxy no proprio PC). Retorna $true / $false / $null (indefinido).
+    try {
+        $procs = Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue
+        if (-not $procs) { return $null }   # sem processo agora (a .bat pode estar entre tentativas)
+        $ids = @($procs | ForEach-Object { $_.Id })
+        $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+                 Where-Object { ($ids -contains $_.OwningProcess) -and ($_.RemoteAddress -notin @('127.0.0.1','::1','0.0.0.0')) }
+        if ($conns) { return $true } else { return $false }
+    } catch { return $null }   # Get-NetTCPConnection indisponivel -> indefinido
+}
 function Test-TunelPublico {
     param([string]$Url,[int]$TimeoutSec=10)
     try {
         $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 3 -ErrorAction Stop
-        return @{ Ok=$true; Detalhe=("HTTP {0}" -f [int]$r.StatusCode) }
+        return @{ Ok=$true; Definitivo=$true; Detalhe=("HTTP {0}" -f [int]$r.StatusCode) }
     } catch {
         $resp=$null; try{$resp=$_.Exception.Response}catch{}
         if ($resp) {
             $sc=0; try{$sc=[int]$resp.StatusCode}catch{}
-            if ($sc -in @(502,503,504,522,523,524)) { return @{ Ok=$false; Detalhe=("HTTP {0} tunel sem resposta" -f $sc) } }
-            return @{ Ok=$true; Detalhe=("HTTP {0} (app respondeu)" -f $sc) }
+            if ($sc -in @(502,503,504,522,523,524)) { return @{ Ok=$false; Definitivo=$true; Detalhe=("HTTP {0} tunel sem resposta" -f $sc) } }
+            return @{ Ok=$true; Definitivo=$true; Detalhe=("HTTP {0} (app respondeu)" -f $sc) }
         }
-        return @{ Ok=$false; Detalhe=("sem resposta: {0}" -f $_.Exception.Message) }
+        # Sem resposta HTTP (TLS/proxy/timeout do proprio PC) = inconclusivo, NAO reinicia.
+        return @{ Ok=$false; Definitivo=$false; Detalhe=("checagem externa indisponivel: {0}" -f $_.Exception.Message) }
     }
 }
 function Iniciar-Tunel {
@@ -359,12 +373,14 @@ function Status-Unico {
     param($Cfg)
     $est = Testar-Conexao -Cfg $Cfg
     $local = Test-PortaLocal -Porta $Cfg.PortaLocal
-    $pub = Test-TunelPublico -Url $Cfg.UrlPublica
     $proc = Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue
+    $conn = Test-TunelConectado
+    $pub = Test-TunelPublico -Url $Cfg.UrlPublica
     Write-Log ("Internet   : {0}" -f $est.Estado) 'INFO'
-    Write-Log ("Processo   : {0}" -f ($(if($proc){"tunnelto rodando (PID $($proc.Id -join ','))"}else{'NAO esta rodando'}))) 'INFO'
+    Write-Log ("Processo   : {0}" -f ($(if($proc){"tunnelto rodando (PID $(($proc | ForEach-Object { $_.Id }) -join ','))"}else{'NAO esta rodando'}))) 'INFO'
+    Write-Log ("Tunel conex: {0}" -f ($(if($conn -eq $true){'CONECTADO (saida estabelecida)'}elseif($conn -eq $false){'SEM conexao de saida'}else{'indefinido'}))) 'INFO'
     Write-Log ("App local  : porta {0} -> {1}" -f $Cfg.PortaLocal,($(if($local){'OK'}else{'nao responde'}))) 'INFO'
-    Write-Log ("Tunel publ.: {0} -> {1} ({2})" -f $Cfg.UrlPublica,($(if($pub.Ok){'OK'}else{'FALHOU'})),$pub.Detalhe) 'INFO'
+    Write-Log ("Tunel publ.: {0} -> {1} ({2})" -f $Cfg.UrlPublica,($(if($pub.Ok){'OK'}else{'nao deu (normal do proprio PC)'})),$pub.Detalhe) 'INFO'
 }
 
 # ============================================================ LOOP PRINCIPAL
@@ -449,22 +465,43 @@ function Iniciar-Supervisor {
                     $tunelInfo = ("aguardando internet ({0})" -f $est.Estado)
                 }
                 else {
-                    $local = Test-PortaLocal -Porta $Cfg.PortaLocal
-                    $pub = Test-TunelPublico -Url $Cfg.UrlPublica
-                    if ($pub.Ok) {
-                        $falhasTunel=0; $tunelInfo=("OK (PID {0}, {1})" -f $script:TunelProc.Id,$pub.Detalhe)
-                    } elseif (-not $local) {
-                        $falhasTunel=0; $tunelInfo=("app local porta {0} NAO responde - veja seu servidor 8080" -f $Cfg.PortaLocal)
-                        Write-Log ("[ciclo {0}] Tunel publico {1}, mas o app local na porta {2} nao responde. Reiniciar o tunel nao resolve isso." -f $ciclo,$pub.Detalhe,$Cfg.PortaLocal) 'AVISO'
-                    } else {
+                    $conectado = Test-TunelConectado
+                    if ($conectado -eq $true) {
+                        $falhasTunel = 0; $tunelInfo = 'OK (tunel conectado)'
+                    }
+                    elseif ($conectado -eq $false) {
+                        # Processo vivo, mas SEM conexao de saida = provavel travamento real.
                         $falhasTunel++
-                        Write-Log ("[ciclo {0}] Tunel sem resposta publica ({1}) [{2}/{3}]. App local: OK." -f $ciclo,$pub.Detalhe,$falhasTunel,$Cfg.FalhasParaReiniciar) 'AVISO'
+                        Write-Log ("[ciclo {0}] tunnelto vivo mas SEM conexao de saida [{1}/{2}] (possivel travamento)." -f $ciclo,$falhasTunel,$Cfg.FalhasParaReiniciar) 'AVISO'
                         if ($falhasTunel -ge $Cfg.FalhasParaReiniciar) {
                             $reinicios++
-                            Reiniciar-Tunel -Cfg $Cfg -Motivo ("tunel travado - {0} (reinicio #{1})" -f $pub.Detalhe,$reinicios)
+                            Reiniciar-Tunel -Cfg $Cfg -Motivo ("tunel sem conexao de saida (reinicio #{0})" -f $reinicios)
                             $script:ProximaChecagemTunel = (Get-Date).AddSeconds($Cfg.GraceAposReinicioSeg)
-                            $falhasTunel=0; $tunelInfo='REABERTO (estava travado)'
-                        } else { $tunelInfo=("instavel ({0})" -f $pub.Detalhe) }
+                            $falhasTunel = 0; $tunelInfo = 'REABERTO (estava travado)'
+                        } else { $tunelInfo = 'instavel (sem conexao de saida)' }
+                    }
+                    else {
+                        # $null: nao deu pra checar pelo processo. Usa a checagem externa,
+                        # mas so reinicia se for um erro DEFINITIVO (502/503/504), nunca por TLS/proxy.
+                        $pub = Test-TunelPublico -Url $Cfg.UrlPublica
+                        if ($pub.Ok) { $falhasTunel = 0; $tunelInfo = ("OK ({0})" -f $pub.Detalhe) }
+                        elseif ($pub.Definitivo) {
+                            $local = Test-PortaLocal -Porta $Cfg.PortaLocal
+                            if (-not $local) {
+                                $falhasTunel = 0; $tunelInfo = 'app local 8080 nao responde'
+                                Write-Log ("[ciclo {0}] App local na porta {1} nao responde (nao e o tunel)." -f $ciclo,$Cfg.PortaLocal) 'AVISO'
+                            } else {
+                                $falhasTunel++
+                                Write-Log ("[ciclo {0}] Tunel sem resposta ({1}) [{2}/{3}]." -f $ciclo,$pub.Detalhe,$falhasTunel,$Cfg.FalhasParaReiniciar) 'AVISO'
+                                if ($falhasTunel -ge $Cfg.FalhasParaReiniciar) {
+                                    $reinicios++
+                                    Reiniciar-Tunel -Cfg $Cfg -Motivo ("tunel travado - {0} (reinicio #{1})" -f $pub.Detalhe,$reinicios)
+                                    $script:ProximaChecagemTunel = (Get-Date).AddSeconds($Cfg.GraceAposReinicioSeg)
+                                    $falhasTunel = 0; $tunelInfo = 'REABERTO (estava travado)'
+                                } else { $tunelInfo = ("instavel ({0})" -f $pub.Detalhe) }
+                            }
+                        }
+                        else { $falhasTunel = 0; $tunelInfo = 'OK (checagem externa indisponivel deste PC)' }
                     }
                 }
             }
