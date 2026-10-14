@@ -274,13 +274,14 @@ function Iniciar-Tunel {
     if (-not $Cfg.Key) { Write-Log 'Sem a chave (--key) do tunel. Coloque em mapanto-config.json ou mantenha o .bat na pasta.' 'ERRO'; return $null }
     try { Get-Process -Name 'tunnelto' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
     Start-Sleep -Milliseconds 600
+    $out = Join-Path $script:PastaLog 'tunnel-saida.log'
+    $err = Join-Path $script:PastaLog 'tunnel-erro.log'
     $argumentos = @('--subdomain',$Cfg.Subdomain,'--port',[string]$Cfg.PortaLocal,'--key',$Cfg.Key)
     $mostra = ("--subdomain {0} --port {1} --key {2}" -f $Cfg.Subdomain,$Cfg.PortaLocal,(Mascarar $Cfg.Key))
     try {
-        # SEM redirecionar a saida: o tunnelto desenha um painel no console e
-        # alguns builds SAEM na hora se a saida vai para arquivo. Rodamos numa
-        # janela propria minimizada (console real), igual ao .bat que funciona.
-        $p = Start-Process -FilePath $Cfg.TunnelExe -ArgumentList $argumentos -WorkingDirectory $Cfg.TunnelDir -WindowStyle Minimized -PassThru
+        # Redireciona a saida do tunnelto para arquivos (nos ajuda a ler o motivo
+        # exato quando ele recusa/cai, ex.: "Server denied the connection").
+        $p = Start-Process -FilePath $Cfg.TunnelExe -ArgumentList $argumentos -WorkingDirectory $Cfg.TunnelDir -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
         $script:TunelProc = $p
         $script:UltimoInicioTunel = Get-Date
         Write-Log ("Tunel iniciado (PID {0}): tunnelto.exe {1}" -f $p.Id,$mostra) 'TUNEL'
@@ -391,15 +392,32 @@ function Iniciar-Supervisor {
                 $vivo = ($script:TunelProc -and -not $script:TunelProc.HasExited)
                 if (-not $vivo) {
                     $viveu = if ($script:UltimoInicioTunel) { ((Get-Date) - $script:UltimoInicioTunel).TotalSeconds } else { 999 }
+                    # Le o motivo que o proprio tunnelto deixou na saida de erro.
+                    $motivo = ''
+                    $errf = Join-Path $script:PastaLog 'tunnel-erro.log'
+                    if (Test-Path $errf) { try { $motivo = (((Get-Content $errf -Tail 6 -ErrorAction SilentlyContinue) -join ' | ') -replace $Cfg.Key,'****').Trim() } catch {} }
+                    $chaveRecusada = ($motivo -match '(?i)access key|denied|unauthor|forbidden|invalid')
+                    if ($motivo) { Write-Log ("Saida do tunel: {0}" -f $motivo) 'INFO' }
                     if ($viveu -lt 20) { $mortesRapidas++ } else { $mortesRapidas = 0 }
-                    if ($mortesRapidas -ge 3) {
+
+                    if ($chaveRecusada) {
+                        Write-Log '===============================================================' 'ERRO'
+                        Write-Log 'O SERVIDOR DO TUNNELTO RECUSOU A SUA CHAVE.' 'ERRO'
+                        Write-Log 'Quase sempre e porque a MESMA chave ja esta ligada em OUTRO lugar' 'ERRO'
+                        Write-Log '(a chave do tunnelto permite 1 tunel por vez).' 'ERRO'
+                        Write-Log '  -> Feche o tunel/.bat antigo no SEU PC principal e rode o Mapanto' 'ERRO'
+                        Write-Log '     em UMA so maquina (a que tem as impressoras e o site na porta 8080).' 'ERRO'
+                        Write-Log '  -> Se nao for isso, confira a chave em https://dashboard.tunnelto.dev' 'ERRO'
+                        Write-Log 'Esperando 60s antes de tentar de novo (evita loop).' 'ERRO'
+                        Write-Log '===============================================================' 'ERRO'
+                        Start-Sleep -Seconds 60
+                        $mortesRapidas = 0
+                    }
+                    elseif ($mortesRapidas -ge 3) {
                         Write-Log '---------------------------------------------------------------' 'ERRO'
                         Write-Log 'O TUNEL ESTA ABRINDO E FECHANDO EM SEGUNDOS, repetidamente.' 'ERRO'
-                        Write-Log 'Causas provaveis:' 'ERRO'
-                        Write-Log '  1) O subdominio "mapanto" ja esta em uso em OUTRA janela/PC' 'ERRO'
-                        Write-Log '     -> feche o "Clica aqui no tunel.bat" antigo em QUALQUER maquina.' 'ERRO'
-                        Write-Log '  2) A chave (--key) esta invalida/expirada.' 'ERRO'
-                        Write-Log '  3) O tunnelto.exe nao consegue sair para a internet.' 'ERRO'
+                        Write-Log ("Ultima saida do tunel: {0}" -f $(if($motivo){$motivo}else{'(vazia)'})) 'ERRO'
+                        Write-Log 'Causas provaveis: chave em uso/invalida, subdominio ocupado, ou sem internet.' 'ERRO'
                         Write-Log 'Esperando 60s antes de tentar de novo (evita loop).' 'ERRO'
                         Write-Log '---------------------------------------------------------------' 'ERRO'
                         Start-Sleep -Seconds 60
